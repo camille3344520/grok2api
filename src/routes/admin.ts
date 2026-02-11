@@ -1,7 +1,12 @@
 import { Hono } from "hono";
 import type { Env } from "../env";
 import { requireAdminAuth } from "../auth";
-import { getSettings, saveSettings, normalizeCfCookie } from "../settings";
+import {
+  getSettings,
+  saveSettings,
+  normalizeCfCookie,
+  normalizeImageGenerationMethod,
+} from "../settings";
 import {
   addApiKey,
   batchAddApiKeys,
@@ -9,6 +14,8 @@ import {
   batchUpdateApiKeyStatus,
   deleteApiKey,
   listApiKeys,
+  validateApiKey,
+  updateApiKeyLimits,
   updateApiKeyName,
   updateApiKeyStatus,
 } from "../repo/apiKeys";
@@ -16,14 +23,18 @@ import { displayKey } from "../utils/crypto";
 import { createAdminSession, deleteAdminSession } from "../repo/adminSessions";
 import {
   addTokens,
+  applyCooldown,
   deleteTokens,
   getAllTags,
   listTokens,
+  recordTokenFailure,
+  selectBestToken,
   tokenRowToInfo,
   updateTokenNote,
   updateTokenTags,
   updateTokenLimits,
 } from "../repo/tokens";
+import { generateImagineWs, resolveAspectRatio } from "../grok/imagineExperimental";
 import { checkRateLimits } from "../grok/rateLimits";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
@@ -36,6 +47,7 @@ import {
 } from "../repo/cache";
 import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
+import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
 
 function jsonError(message: string, code: string): Record<string, unknown> {
   return { error: message, code };
@@ -81,6 +93,75 @@ async function clearKvCacheByType(
     if (keys.length < batch) break;
   }
   return deleted;
+}
+
+function base64UrlEncodeString(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function encodeAssetPath(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `u_${base64UrlEncodeString(u.toString())}`;
+  } catch {
+    const p = raw.startsWith("/") ? raw : `/${raw}`;
+    return `p_${base64UrlEncodeString(p)}`;
+  }
+}
+
+function parseWsMessageData(data: unknown): Record<string, unknown> | null {
+  let raw = "";
+  if (typeof data === "string") raw = data;
+  else if (data instanceof ArrayBuffer) raw = new TextDecoder().decode(data);
+  else if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView;
+    raw = new TextDecoder().decode(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  }
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
+
+function wsSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseImagineWsFailureStatus(message: string): number {
+  const matched = message.match(/Imagine websocket connect failed:\s*(\d{3})\b/i);
+  if (matched) {
+    const status = Number(matched[1]);
+    if (Number.isFinite(status) && status >= 100 && status <= 599) return status;
+  }
+  return 500;
+}
+
+async function verifyWsApiKeyForImagine(c: any): Promise<boolean> {
+  const settings = await getSettings(c.env);
+  const globalKey = String(settings.grok.api_key ?? "").trim();
+  const token = String(c.req.query("api_key") ?? "").trim();
+
+  if (token) {
+    if (globalKey && token === globalKey) return true;
+    const keyInfo = await validateApiKey(c.env.DB, token);
+    return Boolean(keyInfo);
+  }
+
+  if (globalKey) return false;
+  const row = await dbFirst<{ c: number }>(
+    c.env.DB,
+    "SELECT COUNT(1) as c FROM api_keys WHERE is_active = 1",
+  );
+  return (row?.c ?? 0) === 0;
 }
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
@@ -189,6 +270,9 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         cf_clearance: String(settings.grok.cf_clearance ?? ""),
         max_retry: 3,
         retry_status_codes: Array.isArray(settings.grok.retry_status_codes) ? settings.grok.retry_status_codes : [401, 429, 403],
+        image_generation_method: normalizeImageGenerationMethod(
+          settings.grok.image_generation_method,
+        ),
       },
       token: {
         auto_refresh: Boolean(settings.token.auto_refresh),
@@ -235,7 +319,8 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim() || "admin";
       if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim() || "admin";
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
-      if (appCfg.image_format === "url" || appCfg.image_format === "base64") global_config.image_mode = appCfg.image_format;
+      if (appCfg.image_format === "url" || appCfg.image_format === "base64" || appCfg.image_format === "b64_json")
+        global_config.image_mode = appCfg.image_format;
     }
 
     if (grokCfg && typeof grokCfg === "object") {
@@ -254,6 +339,11 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (Array.isArray(grokCfg.retry_status_codes))
         grok_config.retry_status_codes = grokCfg.retry_status_codes.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n));
       if (Number.isFinite(Number(grokCfg.timeout))) grok_config.stream_total_timeout = Math.max(1, Math.floor(Number(grokCfg.timeout)));
+      if (typeof grokCfg.image_generation_method === "string" && grokCfg.image_generation_method.trim()) {
+        grok_config.image_generation_method = normalizeImageGenerationMethod(
+          grokCfg.image_generation_method,
+        );
+      }
     }
 
     if (tokenCfg && typeof tokenCfg === "object") {
@@ -294,6 +384,219 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
   }
 });
 
+adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
+  const upgrade = c.req.header("upgrade") ?? c.req.header("Upgrade");
+  if (String(upgrade ?? "").toLowerCase() !== "websocket") {
+    return c.text("Expected websocket upgrade", 426);
+  }
+
+  const wsPair = new WebSocketPair();
+  const client = wsPair[0];
+  const server = wsPair[1];
+  server.accept();
+
+  const authed = await verifyWsApiKeyForImagine(c);
+  if (!authed) {
+    try {
+      server.close(1008, "Auth failed");
+    } catch {
+      // ignore close failure
+    }
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  const settings = await getSettings(c.env);
+  const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+
+  let socketClosed = false;
+  let runToken = 0;
+  let currentRunId = "";
+  let sequence = 0;
+  let running = false;
+
+  const send = (payload: Record<string, unknown>): boolean => {
+    if (socketClosed) return false;
+    try {
+      server.send(JSON.stringify(payload));
+      return true;
+    } catch {
+      socketClosed = true;
+      return false;
+    }
+  };
+
+  const stopRun = (sendStatus: boolean): void => {
+    if (!running) return;
+    running = false;
+    runToken += 1;
+    if (sendStatus && currentRunId) {
+      send({ type: "status", status: "stopped", run_id: currentRunId });
+    }
+  };
+
+  const startRun = (prompt: string, aspectRatio: string): void => {
+    runToken += 1;
+    const localToken = runToken;
+    running = true;
+    currentRunId = crypto.randomUUID().replaceAll("-", "");
+    const runId = currentRunId;
+    sequence = 0;
+
+    send({
+      type: "status",
+      status: "running",
+      prompt,
+      aspect_ratio: aspectRatio,
+      run_id: runId,
+    });
+
+    void (async () => {
+      while (!socketClosed && localToken === runToken) {
+        let chosen: { token: string; token_type: "sso" | "ssoSuper" } | null = null;
+        try {
+          chosen = await selectBestToken(c.env.DB, "grok-imagine-1.0");
+          if (!chosen) {
+            send({
+              type: "error",
+              message: "No available tokens. Please try again later.",
+              code: "rate_limit_exceeded",
+            });
+            await wsSleep(2000);
+            continue;
+          }
+
+          const cookie = cf
+            ? `sso-rw=${chosen.token};sso=${chosen.token};${cf}`
+            : `sso-rw=${chosen.token};sso=${chosen.token}`;
+          const startAt = Date.now();
+          const urls = await generateImagineWs({
+            prompt,
+            n: 6,
+            cookie,
+            settings: settings.grok,
+            aspectRatio,
+          });
+          if (socketClosed || localToken !== runToken) break;
+
+          const elapsedMs = Date.now() - startAt;
+          let sentAny = false;
+          for (const rawUrl of urls) {
+            const raw = String(rawUrl ?? "").trim();
+            if (!raw) continue;
+            sentAny = true;
+            sequence += 1;
+            const encoded = encodeAssetPath(raw);
+            const url = `/images/${encodeURIComponent(encoded)}`;
+            const ok = send({
+              type: "image",
+              url,
+              sequence,
+              created_at: Date.now(),
+              elapsed_ms: elapsedMs,
+              aspect_ratio: aspectRatio,
+              run_id: runId,
+            });
+            if (!ok) {
+              socketClosed = true;
+              break;
+            }
+          }
+
+          if (!sentAny) {
+            send({
+              type: "error",
+              message: "Image generation returned empty data.",
+              code: "empty_image",
+            });
+          }
+        } catch (e) {
+          if (socketClosed || localToken !== runToken) break;
+          const message = e instanceof Error ? e.message : String(e);
+          if (chosen?.token) {
+            const status = parseImagineWsFailureStatus(message);
+            const trimmed = message.slice(0, 200);
+            try {
+              await recordTokenFailure(c.env.DB, chosen.token, status, trimmed);
+              await applyCooldown(c.env.DB, chosen.token, status);
+            } catch {
+              // ignore token cooldown failures
+            }
+          }
+          send({
+            type: "error",
+            message: message || "Internal error",
+            code: "internal_error",
+          });
+          await wsSleep(1500);
+        }
+      }
+
+      if (!socketClosed && localToken === runToken) {
+        running = false;
+        send({ type: "status", status: "stopped", run_id: runId });
+      }
+    })();
+  };
+
+  server.addEventListener("message", (event) => {
+    const payload = parseWsMessageData(event.data);
+    if (!payload) {
+      send({
+        type: "error",
+        message: "Invalid message format.",
+        code: "invalid_payload",
+      });
+      return;
+    }
+
+    const msgType = String(payload.type ?? "").trim();
+    if (msgType === "start") {
+      const prompt = String(payload.prompt ?? "").trim();
+      if (!prompt) {
+        send({
+          type: "error",
+          message: "Prompt cannot be empty.",
+          code: "empty_prompt",
+        });
+        return;
+      }
+      const ratio = resolveAspectRatio(String(payload.aspect_ratio ?? "2:3").trim());
+      stopRun(false);
+      startRun(prompt, ratio);
+      return;
+    }
+
+    if (msgType === "stop") {
+      stopRun(true);
+      return;
+    }
+
+    if (msgType === "ping") {
+      send({ type: "pong" });
+      return;
+    }
+
+    send({
+      type: "error",
+      message: "Unknown command.",
+      code: "unknown_command",
+    });
+  });
+
+  server.addEventListener("close", () => {
+    socketClosed = true;
+    runToken += 1;
+    running = false;
+  });
+  server.addEventListener("error", () => {
+    socketClosed = true;
+    runToken += 1;
+    running = false;
+  });
+
+  return new Response(null, { status: 101, webSocket: client });
+});
+
 adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
   try {
     const rows = await listTokens(c.env.DB);
@@ -304,12 +607,19 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
       const pool = toPoolName(r.token_type);
       const isCooling = Boolean(r.cooldown_until && r.cooldown_until > now);
       const status = r.status === "expired" ? "invalid" : isCooling ? "cooling" : "active";
-      const quotaRaw = r.remaining_queries;
-      const quota = quotaRaw >= 0 ? quotaRaw : 0;
+      const quotaKnown = Number.isFinite(r.remaining_queries) && r.remaining_queries >= 0;
+      const quota = quotaKnown ? r.remaining_queries : -1;
+      const heavyQuotaKnown =
+        r.token_type === "ssoSuper" && Number.isFinite(r.heavy_remaining_queries) && r.heavy_remaining_queries >= 0;
+      const heavyQuota = heavyQuotaKnown ? r.heavy_remaining_queries : -1;
       out[pool].push({
         token: `sso=${r.token}`,
         status,
         quota,
+        quota_known: quotaKnown,
+        heavy_quota: heavyQuota,
+        heavy_quota_known: heavyQuotaKnown,
+        token_type: r.token_type,
         note: r.note ?? "",
         fail_count: r.failed_count ?? 0,
         use_count: 0,
@@ -353,13 +663,18 @@ adminRoutes.post("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
         const statusRaw = typeof it === "string" ? "active" : String((it as any)?.status ?? "active");
         const quotaRaw = typeof it === "string" ? 0 : Number((it as any)?.quota ?? 0);
         const quota = Number.isFinite(quotaRaw) && quotaRaw >= 0 ? Math.floor(quotaRaw) : -1;
+        const heavyQuotaRaw =
+          typeof it === "string"
+            ? -1
+            : Number((it as any)?.heavy_quota ?? (tokenType === "ssoSuper" ? quota : -1));
+        const heavyQuota = Number.isFinite(heavyQuotaRaw) && heavyQuotaRaw >= 0 ? Math.floor(heavyQuotaRaw) : -1;
         const note = typeof it === "string" ? "" : String((it as any)?.note ?? "");
 
         const status = statusRaw === "invalid" ? "expired" : "active";
         const cooldownUntil = statusRaw === "cooling" ? now + 60 * 60 * 1000 : null;
 
         const remaining = quota >= 0 ? quota : -1;
-        const heavy = tokenType === "ssoSuper" ? remaining : -1;
+        const heavy = tokenType === "ssoSuper" ? heavyQuota : -1;
 
         stmts.push(
           c.env.DB.prepare(
@@ -402,14 +717,34 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     const settings = await getSettings(c.env);
     const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
 
+    const placeholders = unique.map(() => "?").join(",");
+    const typeRows = placeholders
+      ? await dbAll<{ token: string; token_type: string }>(
+          c.env.DB,
+          `SELECT token, token_type FROM tokens WHERE token IN (${placeholders})`,
+          unique,
+        )
+      : [];
+    const tokenTypeByToken = new Map(typeRows.map((r) => [r.token, r.token_type]));
+
     const results: Record<string, boolean> = {};
     for (const t of unique) {
       try {
         const cookie = cf ? `sso-rw=${t};sso=${t};${cf}` : `sso-rw=${t};sso=${t}`;
+        const tokenType = tokenTypeByToken.get(t) ?? "sso";
         const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
         const remaining = (r as any)?.remainingTokens;
+        let heavyRemaining: number | null = null;
+        if (tokenType === "ssoSuper") {
+          const rh = await checkRateLimits(cookie, settings.grok, "grok-4-heavy");
+          const hv = (rh as any)?.remainingTokens;
+          if (typeof hv === "number") heavyRemaining = hv;
+        }
         if (typeof remaining === "number") {
-          await updateTokenLimits(c.env.DB, t, { remaining_queries: remaining });
+          await updateTokenLimits(c.env.DB, t, {
+            remaining_queries: remaining,
+            ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
+          });
           results[`sso=${t}`] = true;
         } else {
           results[`sso=${t}`] = false;
@@ -704,11 +1039,26 @@ adminRoutes.post("/api/tokens/test", requireAdminAuth, async (c) => {
     if (result) {
       const remaining = (result as any).remainingTokens ?? -1;
       const limit = (result as any).limit ?? -1;
-      await updateTokenLimits(c.env.DB, token, { remaining_queries: typeof remaining === "number" ? remaining : -1 });
+
+      let heavyRemaining: number | null = null;
+      if (token_type === "ssoSuper") {
+        const heavy = await checkRateLimits(cookie, settings.grok, "grok-4-heavy");
+        const v = (heavy as any)?.remainingTokens;
+        if (typeof v === "number") heavyRemaining = v;
+      }
+      await updateTokenLimits(c.env.DB, token, {
+        remaining_queries: typeof remaining === "number" ? remaining : -1,
+        ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
+      });
       return c.json({
         success: true,
         message: "Token有效",
-        data: { valid: true, remaining_queries: typeof remaining === "number" ? remaining : -1, limit },
+        data: {
+          valid: true,
+          remaining_queries: typeof remaining === "number" ? remaining : -1,
+          heavy_remaining_queries: heavyRemaining !== null ? heavyRemaining : -1,
+          limit,
+        },
       });
     }
 
@@ -780,7 +1130,18 @@ adminRoutes.post("/api/tokens/refresh-all", requireAdminAuth, async (c) => {
           const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
           if (r) {
             const remaining = (r as any).remainingTokens;
-            if (typeof remaining === "number") await updateTokenLimits(c.env.DB, t.token, { remaining_queries: remaining });
+            let heavyRemaining: number | null = null;
+            if (t.token_type === "ssoSuper") {
+              const rh = await checkRateLimits(cookie, settings.grok, "grok-4-heavy");
+              const hv = (rh as any)?.remainingTokens;
+              if (typeof hv === "number") heavyRemaining = hv;
+            }
+            if (typeof remaining === "number") {
+              await updateTokenLimits(c.env.DB, t.token, {
+                remaining_queries: remaining,
+                ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
+              });
+            }
             success += 1;
           } else {
             failed += 1;
@@ -859,6 +1220,128 @@ adminRoutes.get("/api/request-stats", requireAdminAuth, async (c) => {
     return c.json({ success: true, data: stats });
   } catch (e) {
     return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "REQUEST_STATS_ERROR"), 500);
+  }
+});
+
+// === API Keys (admin UI) ===
+function randomKeyName(): string {
+  return `key-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+adminRoutes.get("/api/v1/admin/keys", requireAdminAuth, async (c) => {
+  try {
+    const keys = await listApiKeys(c.env.DB);
+    const tz = Math.max(-720, Math.min(840, Number(c.env.CACHE_RESET_TZ_OFFSET_MINUTES ?? 480)));
+    const day = localDayString(nowMs(), tz);
+    const usageRows = await listUsageForDay(c.env.DB, day);
+    const usageMap = new Map(usageRows.map((r) => [r.key, r]));
+
+    const data = keys.map((k) => {
+      const used = usageMap.get(k.key) ?? { chat_used: 0, heavy_used: 0, image_used: 0, video_used: 0 };
+      const remaining = {
+        chat: k.chat_limit < 0 ? null : Math.max(0, k.chat_limit - Number((used as any).chat_used ?? 0)),
+        heavy: k.heavy_limit < 0 ? null : Math.max(0, k.heavy_limit - Number((used as any).heavy_used ?? 0)),
+        image: k.image_limit < 0 ? null : Math.max(0, k.image_limit - Number((used as any).image_used ?? 0)),
+        video: k.video_limit < 0 ? null : Math.max(0, k.video_limit - Number((used as any).video_used ?? 0)),
+      };
+      return {
+        ...k,
+        is_active: Boolean(k.is_active),
+        display_key: displayKey(k.key),
+        usage_today: {
+          chat_used: Number((used as any).chat_used ?? 0),
+          heavy_used: Number((used as any).heavy_used ?? 0),
+          image_used: Number((used as any).image_used ?? 0),
+          video_used: Number((used as any).video_used ?? 0),
+        },
+        remaining_today: remaining,
+      };
+    });
+
+    return c.json({ success: true, data });
+  } catch (e) {
+    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_LIST_ERROR"), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/keys", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const name = String(body?.name ?? "").trim() || randomKeyName();
+    const key = String(body?.key ?? "").trim();
+    const limits = body?.limits && typeof body.limits === "object" ? body.limits : {};
+
+    const row = await addApiKey(c.env.DB, name, {
+      ...(key ? { key } : {}),
+      limits: {
+        chat_limit: limits.chat_per_day ?? limits.chat_limit,
+        heavy_limit: limits.heavy_per_day ?? limits.heavy_limit,
+        image_limit: limits.image_per_day ?? limits.image_limit,
+        video_limit: limits.video_per_day ?? limits.video_limit,
+      },
+    });
+
+    const isActive = body?.is_active !== undefined ? Boolean(body.is_active) : true;
+    if (!isActive) await updateApiKeyStatus(c.env.DB, row.key, false);
+
+    return c.json({ success: true, data: { ...row, is_active: isActive, display_key: displayKey(row.key) } });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/UNIQUE|constraint/i.test(msg)) return c.json(jsonError("Key 已存在", "KEY_EXISTS"), 400);
+    return c.json(jsonError(`创建失败: ${msg}`, "ADMIN_KEYS_CREATE_ERROR"), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/keys/update", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const key = String(body?.key ?? "").trim();
+    if (!key) return c.json(jsonError("Missing key", "MISSING_KEY"), 400);
+    const existed = await dbFirst<{ key: string }>(c.env.DB, "SELECT key FROM api_keys WHERE key = ?", [key]);
+    if (!existed) return c.json(jsonError("Key not found", "NOT_FOUND"), 404);
+
+    if (body?.name !== undefined) {
+      const name = String(body.name ?? "").trim();
+      if (name) await updateApiKeyName(c.env.DB, key, name);
+    }
+
+    if (body?.is_active !== undefined) {
+      await updateApiKeyStatus(c.env.DB, key, Boolean(body.is_active));
+    }
+
+    if (body?.limits && typeof body.limits === "object") {
+      const limits = body.limits;
+      await updateApiKeyLimits(c.env.DB, key, {
+        ...(limits.chat_per_day !== undefined || limits.chat_limit !== undefined
+          ? { chat_limit: limits.chat_per_day ?? limits.chat_limit }
+          : {}),
+        ...(limits.heavy_per_day !== undefined || limits.heavy_limit !== undefined
+          ? { heavy_limit: limits.heavy_per_day ?? limits.heavy_limit }
+          : {}),
+        ...(limits.image_per_day !== undefined || limits.image_limit !== undefined
+          ? { image_limit: limits.image_per_day ?? limits.image_limit }
+          : {}),
+        ...(limits.video_per_day !== undefined || limits.video_limit !== undefined
+          ? { video_limit: limits.video_per_day ?? limits.video_limit }
+          : {}),
+      });
+    }
+
+    return c.json({ success: true });
+  } catch (e) {
+    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_UPDATE_ERROR"), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/keys/delete", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json()) as any;
+    const key = String(body?.key ?? "").trim();
+    if (!key) return c.json(jsonError("Missing key", "MISSING_KEY"), 400);
+    const ok = await deleteApiKey(c.env.DB, key);
+    return c.json(ok ? { success: true } : jsonError("Key not found", "NOT_FOUND"), ok ? 200 : 404);
+  } catch (e) {
+    return c.json(jsonError(`删除失败: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_DELETE_ERROR"), 500);
   }
 });
 

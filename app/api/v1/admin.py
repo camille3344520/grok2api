@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body, WebSocket
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
+from typing import Any, Optional
 
 from app.core.auth import verify_api_key
 from app.core.config import config, get_config
@@ -10,8 +11,25 @@ from pathlib import Path
 import aiofiles
 import asyncio
 import json
+import time
+import uuid
+import orjson
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 from app.core.logger import logger
 from app.services.register import get_auto_register_manager
+from app.services.register.account_settings_refresh import (
+    refresh_account_settings_for_tokens,
+    normalize_sso_token as normalize_refresh_token,
+)
+from app.services.api_keys import api_key_manager
+from app.services.grok.model import ModelService
+from app.services.grok.imagine_generation import (
+    collect_experimental_generation_images,
+    is_valid_image_value as is_valid_imagine_image_value,
+    resolve_aspect_ratio as resolve_imagine_aspect_ratio,
+)
+from app.services.token import get_token_manager
+from app.core.auth import _load_legacy_api_keys
 
 
 router = APIRouter()
@@ -65,6 +83,243 @@ async def admin_datacenter_page():
     """数据中心页"""
     return await render_template("datacenter/datacenter.html")
 
+@router.get("/admin/keys", response_class=HTMLResponse, include_in_schema=False)
+async def admin_keys_page():
+    """API Key 管理页"""
+    return await render_template("keys/keys.html")
+
+@router.get("/chat", response_class=HTMLResponse, include_in_schema=False)
+async def chat_page():
+    """在线聊天页（公开入口）"""
+    return await render_template("chat/chat.html")
+
+@router.get("/admin/chat", response_class=HTMLResponse, include_in_schema=False)
+async def admin_chat_page():
+    """在线聊天页（后台入口）"""
+    return await render_template("chat/chat_admin.html")
+
+
+async def _verify_ws_api_key(websocket: WebSocket) -> bool:
+    api_key = str(get_config("app.api_key", "") or "").strip()
+    legacy_keys = await _load_legacy_api_keys()
+    if not api_key and not legacy_keys:
+        return True
+    token = str(websocket.query_params.get("api_key") or "").strip()
+    if not token:
+        return False
+    if (api_key and token == api_key) or token in legacy_keys:
+        return True
+    try:
+        await api_key_manager.init()
+        if api_key_manager.validate_key(token):
+            return True
+    except Exception as e:
+        logger.warning(f"Imagine ws api_key validation fallback failed: {e}")
+    return False
+
+
+async def _collect_imagine_batch(token: str, prompt: str, aspect_ratio: str) -> list[str]:
+    return await collect_experimental_generation_images(
+        token=token,
+        prompt=prompt,
+        n=6,
+        response_format="b64_json",
+        aspect_ratio=aspect_ratio,
+        concurrency=1,
+    )
+
+
+@router.websocket("/api/v1/admin/imagine/ws")
+async def admin_imagine_ws(websocket: WebSocket):
+    if not await _verify_ws_api_key(websocket):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    stop_event = asyncio.Event()
+    run_task: Optional[asyncio.Task] = None
+
+    async def _send(payload: dict) -> bool:
+        try:
+            await websocket.send_text(orjson.dumps(payload).decode())
+            return True
+        except Exception:
+            return False
+
+    async def _stop_run():
+        nonlocal run_task
+        stop_event.set()
+        if run_task and not run_task.done():
+            run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        run_task = None
+        stop_event.clear()
+
+    async def _run(prompt: str, aspect_ratio: str):
+        model_id = "grok-imagine-1.0"
+        model_info = ModelService.get(model_id)
+        if not model_info or not model_info.is_image:
+            await _send(
+                {
+                    "type": "error",
+                    "message": "Image model is not available.",
+                    "code": "model_not_supported",
+                }
+            )
+            return
+
+        token_mgr = await get_token_manager()
+        sequence = 0
+        run_id = uuid.uuid4().hex
+        await _send(
+            {
+                "type": "status",
+                "status": "running",
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "run_id": run_id,
+            }
+        )
+
+        while not stop_event.is_set():
+            try:
+                await token_mgr.reload_if_stale()
+                token = token_mgr.get_token_for_model(model_info.model_id)
+                if not token:
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": "No available tokens. Please try again later.",
+                            "code": "rate_limit_exceeded",
+                        }
+                    )
+                    await asyncio.sleep(2)
+                    continue
+
+                start_at = time.time()
+                images = await _collect_imagine_batch(token, prompt, aspect_ratio)
+                elapsed_ms = int((time.time() - start_at) * 1000)
+
+                sent_any = False
+                for image_b64 in images:
+                    if not is_valid_imagine_image_value(image_b64):
+                        continue
+                    sent_any = True
+                    sequence += 1
+                    ok = await _send(
+                        {
+                            "type": "image",
+                            "b64_json": image_b64,
+                            "sequence": sequence,
+                            "created_at": int(time.time() * 1000),
+                            "elapsed_ms": elapsed_ms,
+                            "aspect_ratio": aspect_ratio,
+                            "run_id": run_id,
+                        }
+                    )
+                    if not ok:
+                        stop_event.set()
+                        break
+
+                if sent_any:
+                    try:
+                        await token_mgr.sync_usage(
+                            token,
+                            model_info.model_id,
+                            consume_on_fail=True,
+                            is_usage=True,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Imagine ws token sync failed: {e}")
+                else:
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": "Image generation returned empty data.",
+                            "code": "empty_image",
+                        }
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Imagine stream error: {e}")
+                await _send(
+                    {
+                        "type": "error",
+                        "message": str(e),
+                        "code": "internal_error",
+                    }
+                )
+                await asyncio.sleep(1.5)
+
+        await _send({"type": "status", "status": "stopped", "run_id": run_id})
+
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except (RuntimeError, WebSocketDisconnect):
+                break
+
+            try:
+                payload = orjson.loads(raw)
+            except Exception:
+                await _send(
+                    {
+                        "type": "error",
+                        "message": "Invalid message format.",
+                        "code": "invalid_payload",
+                    }
+                )
+                continue
+
+            msg_type = payload.get("type")
+            if msg_type == "start":
+                prompt = str(payload.get("prompt") or "").strip()
+                if not prompt:
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": "Prompt cannot be empty.",
+                            "code": "empty_prompt",
+                        }
+                    )
+                    continue
+                ratio = resolve_imagine_aspect_ratio(str(payload.get("aspect_ratio") or "2:3").strip())
+                await _stop_run()
+                run_task = asyncio.create_task(_run(prompt, ratio))
+            elif msg_type == "stop":
+                await _stop_run()
+            elif msg_type == "ping":
+                await _send({"type": "pong"})
+            else:
+                await _send(
+                    {
+                        "type": "error",
+                        "message": "Unknown command.",
+                        "code": "unknown_command",
+                    }
+                )
+    except WebSocketDisconnect:
+        logger.debug("WebSocket disconnected by client")
+    except asyncio.CancelledError:
+        logger.debug("WebSocket handler cancelled")
+    except Exception as e:
+        logger.warning(f"WebSocket error: {e}")
+    finally:
+        await _stop_run()
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close(code=1000, reason="Server closing connection")
+        except Exception as e:
+            logger.debug(f"WebSocket close ignored: {e}")
+
+
 @router.post("/api/v1/admin/login")
 async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(default=None)):
     """管理后台登录验证（用户名+密码）
@@ -110,6 +365,293 @@ async def update_config_api(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def _display_key(key: str) -> str:
+    k = str(key or "")
+    if len(k) <= 12:
+        return k
+    return f"{k[:6]}...{k[-4:]}"
+
+
+def _normalize_limit(v: Any) -> int:
+    if v is None or v == "":
+        return -1
+    try:
+        return max(-1, int(v))
+    except Exception:
+        return -1
+
+
+def _pool_to_token_type(pool_name: str) -> str:
+    return "ssoSuper" if str(pool_name or "").strip() == "ssoSuper" else "sso"
+
+
+def _parse_quota_value(v: Any) -> tuple[int, bool]:
+    if v is None or v == "":
+        return -1, False
+    try:
+        n = int(v)
+    except Exception:
+        return -1, False
+    if n < 0:
+        return -1, False
+    return n, True
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _normalize_token_status(raw_status: Any) -> str:
+    s = str(raw_status or "active").strip().lower()
+    if s == "expired":
+        return "invalid"
+    if s in ("active", "cooling", "invalid", "disabled"):
+        return s
+    return "active"
+
+
+def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
+    token_type = _pool_to_token_type(pool_name)
+
+    if isinstance(item, str):
+        token = item.strip()
+        if not token:
+            return None
+        if token.startswith("sso="):
+            token = token[4:]
+        return {
+            "token": token,
+            "status": "active",
+            "quota": 0,
+            "quota_known": False,
+            "heavy_quota": -1,
+            "heavy_quota_known": False,
+            "token_type": token_type,
+            "note": "",
+            "fail_count": 0,
+            "use_count": 0,
+        }
+
+    if not isinstance(item, dict):
+        return None
+
+    token = str(item.get("token") or "").strip()
+    if not token:
+        return None
+    if token.startswith("sso="):
+        token = token[4:]
+
+    quota, quota_known = _parse_quota_value(item.get("quota"))
+    heavy_quota, heavy_quota_known = _parse_quota_value(item.get("heavy_quota"))
+
+    return {
+        "token": token,
+        "status": _normalize_token_status(item.get("status")),
+        "quota": quota if quota_known else 0,
+        "quota_known": quota_known,
+        "heavy_quota": heavy_quota,
+        "heavy_quota_known": heavy_quota_known,
+        "token_type": token_type,
+        "note": str(item.get("note") or ""),
+        "fail_count": _safe_int(item.get("fail_count") or 0, 0),
+        "use_count": _safe_int(item.get("use_count") or 0, 0),
+    }
+
+
+def _collect_tokens_from_pool_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    collected: list[str] = []
+    seen: set[str] = set()
+    for raw_items in payload.values():
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            token_raw = item if isinstance(item, str) else (item.get("token") if isinstance(item, dict) else "")
+            token = normalize_refresh_token(str(token_raw or "").strip())
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            collected.append(token)
+    return collected
+
+
+def _resolve_nsfw_refresh_concurrency(override: Any = None) -> int:
+    source = override if override is not None else get_config("token.nsfw_refresh_concurrency", 10)
+    try:
+        value = int(source)
+    except Exception:
+        value = 10
+    return max(1, value)
+
+
+def _resolve_nsfw_refresh_retries(override: Any = None) -> int:
+    source = override if override is not None else get_config("token.nsfw_refresh_retries", 3)
+    try:
+        value = int(source)
+    except Exception:
+        value = 3
+    return max(0, value)
+
+
+def _trigger_account_settings_refresh_background(
+    tokens: list[str],
+    concurrency: int,
+    retries: int,
+) -> None:
+    if not tokens:
+        return
+
+    async def _run() -> None:
+        try:
+            result = await refresh_account_settings_for_tokens(
+                tokens=tokens,
+                concurrency=concurrency,
+                retries=retries,
+            )
+            summary = result.get("summary") or {}
+            logger.info(
+                "Background account-settings refresh finished: total={} success={} failed={} invalidated={}",
+                summary.get("total", 0),
+                summary.get("success", 0),
+                summary.get("failed", 0),
+                summary.get("invalidated", 0),
+            )
+        except Exception as exc:
+            logger.warning("Background account-settings refresh failed: {}", exc)
+
+    asyncio.create_task(_run())
+
+
+@router.get("/api/v1/admin/keys", dependencies=[Depends(verify_api_key)])
+async def list_api_keys():
+    """List API keys + daily usage/remaining (for admin UI)."""
+    await api_key_manager.init()
+    day, usage_map = await api_key_manager.usage_today()
+
+    out = []
+    for row in api_key_manager.get_all_keys():
+        key = str(row.get("key") or "")
+        used = usage_map.get(key) or {}
+        chat_used = int(used.get("chat_used", 0) or 0)
+        heavy_used = int(used.get("heavy_used", 0) or 0)
+        image_used = int(used.get("image_used", 0) or 0)
+        video_used = int(used.get("video_used", 0) or 0)
+
+        chat_limit = _normalize_limit(row.get("chat_limit", -1))
+        heavy_limit = _normalize_limit(row.get("heavy_limit", -1))
+        image_limit = _normalize_limit(row.get("image_limit", -1))
+        video_limit = _normalize_limit(row.get("video_limit", -1))
+
+        remaining = {
+            "chat": None if chat_limit < 0 else max(0, chat_limit - chat_used),
+            "heavy": None if heavy_limit < 0 else max(0, heavy_limit - heavy_used),
+            "image": None if image_limit < 0 else max(0, image_limit - image_used),
+            "video": None if video_limit < 0 else max(0, video_limit - video_used),
+        }
+
+        out.append({
+            **row,
+            "is_active": bool(row.get("is_active", True)),
+            "display_key": _display_key(key),
+            "usage_today": {
+                "chat_used": chat_used,
+                "heavy_used": heavy_used,
+                "image_used": image_used,
+                "video_used": video_used,
+            },
+            "remaining_today": remaining,
+            "day": day,
+        })
+
+    # New UI expects { success: true, data: [...] }
+    return {"success": True, "data": out}
+
+
+@router.post("/api/v1/admin/keys", dependencies=[Depends(verify_api_key)])
+async def create_api_key(data: dict):
+    """Create a new API key (optional name/key/limits)."""
+    await api_key_manager.init()
+    data = data or {}
+
+    name = str(data.get("name") or "").strip() or api_key_manager.generate_name()
+    key_val = str(data.get("key") or "").strip() or None
+    is_active = bool(data.get("is_active", True))
+
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
+    try:
+        row = await api_key_manager.add_key(
+            name=name,
+            key=key_val,
+            is_active=is_active,
+            limits={
+                "chat_per_day": limits.get("chat_per_day"),
+                "heavy_per_day": limits.get("heavy_per_day"),
+                "image_per_day": limits.get("image_per_day"),
+                "video_per_day": limits.get("video_per_day"),
+            },
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"success": True, "data": {**row, "display_key": _display_key(row.get("key", ""))}}
+
+
+@router.post("/api/v1/admin/keys/update", dependencies=[Depends(verify_api_key)])
+async def update_api_key(data: dict):
+    """Update name/status/limits for an API key."""
+    await api_key_manager.init()
+    data = data or {}
+    key = str(data.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Missing key")
+
+    existing = api_key_manager.get_key_row(key)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    if "name" in data and data.get("name") is not None:
+        name = str(data.get("name") or "").strip()
+        if name:
+            await api_key_manager.update_key_name(key, name)
+
+    if "is_active" in data:
+        await api_key_manager.update_key_status(key, bool(data.get("is_active")))
+
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else None
+    if limits is not None:
+        await api_key_manager.update_key_limits(
+            key,
+            {
+                "chat_per_day": limits.get("chat_per_day"),
+                "heavy_per_day": limits.get("heavy_per_day"),
+                "image_per_day": limits.get("image_per_day"),
+                "video_per_day": limits.get("video_per_day"),
+            },
+        )
+
+    return {"success": True}
+
+
+@router.post("/api/v1/admin/keys/delete", dependencies=[Depends(verify_api_key)])
+async def delete_api_key(data: dict):
+    """Delete an API key."""
+    await api_key_manager.init()
+    data = data or {}
+    key = str(data.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Missing key")
+
+    ok = await api_key_manager.delete_key(key)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"success": True}
+
 @router.get("/api/v1/admin/storage", dependencies=[Depends(verify_api_key)])
 async def get_storage_info():
     """获取当前存储模式"""
@@ -137,19 +679,61 @@ async def get_tokens_api():
     """获取所有 Token"""
     storage = get_storage()
     tokens = await storage.load_tokens()
-    return tokens or {}
+    data = tokens if isinstance(tokens, dict) else {}
+    out: dict[str, list[dict]] = {}
+    for pool_name, raw_items in data.items():
+        arr = raw_items if isinstance(raw_items, list) else []
+        normalized: list[dict] = []
+        for item in arr:
+            obj = _normalize_admin_token_item(pool_name, item)
+            if obj:
+                normalized.append(obj)
+        out[str(pool_name)] = normalized
+    return out
 
 @router.post("/api/v1/admin/tokens", dependencies=[Depends(verify_api_key)])
 async def update_tokens_api(data: dict):
-    """更新 Token 信息"""
+    """Update token payload and trigger background account-settings refresh for new tokens."""
     storage = get_storage()
     try:
         from app.services.token.manager import get_token_manager
+
+        posted_data = data if isinstance(data, dict) else {}
+        existing_tokens: list[str] = []
+        added_tokens: list[str] = []
+
         async with storage.acquire_lock("tokens_save", timeout=10):
-            await storage.save_tokens(data)
+            old_data = await storage.load_tokens()
+            existing_tokens = _collect_tokens_from_pool_payload(
+                old_data if isinstance(old_data, dict) else {}
+            )
+
+            await storage.save_tokens(posted_data)
             mgr = await get_token_manager()
             await mgr.reload()
-        return {"status": "success", "message": "Token 已更新"}
+
+            new_tokens = _collect_tokens_from_pool_payload(posted_data)
+            existing_set = set(existing_tokens)
+            added_tokens = [token for token in new_tokens if token not in existing_set]
+
+        concurrency = _resolve_nsfw_refresh_concurrency()
+        retries = _resolve_nsfw_refresh_retries()
+        _trigger_account_settings_refresh_background(
+            tokens=added_tokens,
+            concurrency=concurrency,
+            retries=retries,
+        )
+
+        return {
+            "status": "success",
+            "message": "Token updated",
+            "nsfw_refresh": {
+                "mode": "background",
+                "triggered": len(added_tokens),
+                "concurrency": concurrency,
+                "retries": retries,
+            },
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -183,6 +767,56 @@ async def refresh_tokens_api(data: dict):
         return {"status": "success", "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/v1/admin/tokens/nsfw/refresh", dependencies=[Depends(verify_api_key)])
+async def refresh_tokens_nsfw_api(data: dict):
+    """Refresh account settings (TOS + birth date + NSFW) for selected/all tokens."""
+    payload = data if isinstance(data, dict) else {}
+    mgr = await get_token_manager()
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    if bool(payload.get("all")):
+        for pool in mgr.pools.values():
+            for info in pool.list():
+                token = normalize_refresh_token(str(info.token or "").strip())
+                if not token or token in seen:
+                    continue
+                seen.add(token)
+                tokens.append(token)
+    else:
+        candidates: list[str] = []
+        single = payload.get("token")
+        if isinstance(single, str):
+            candidates.append(single)
+        batch = payload.get("tokens")
+        if isinstance(batch, list):
+            candidates.extend([item for item in batch if isinstance(item, str)])
+
+        for raw in candidates:
+            token = normalize_refresh_token(str(raw or "").strip())
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+
+    if not tokens:
+        raise HTTPException(status_code=400, detail="No tokens provided")
+
+    concurrency = _resolve_nsfw_refresh_concurrency(payload.get("concurrency"))
+    retries = _resolve_nsfw_refresh_retries(payload.get("retries"))
+    result = await refresh_account_settings_for_tokens(
+        tokens=tokens,
+        concurrency=concurrency,
+        retries=retries,
+    )
+    return {
+        "status": "success",
+        "summary": result.get("summary") or {},
+        "failed": result.get("failed") or [],
+    }
 
 
 @router.post("/api/v1/admin/tokens/auto-register", dependencies=[Depends(verify_api_key)])
